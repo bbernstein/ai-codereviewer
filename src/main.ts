@@ -1,20 +1,19 @@
 import { readFileSync } from "fs";
 import * as core from "@actions/core";
-import { Configuration, OpenAIApi } from "openai";
+import OpenAI from "openai";
 import { Octokit } from "@octokit/rest";
 import parseDiff, { Chunk, File } from "parse-diff";
 import minimatch from "minimatch";
 
 const GITHUB_TOKEN: string = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY: string = core.getInput("OPENAI_API_KEY");
+const OPENAI_API_MODEL: string = core.getInput("OPENAI_API_MODEL");
 
 const octokit = new Octokit({ auth: GITHUB_TOKEN });
 
-const configuration = new Configuration({
+const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,
 });
-
-const openai = new OpenAIApi(configuration);
 
 interface PRDetails {
   owner: string;
@@ -79,27 +78,11 @@ async function analyzeCode(
   return comments;
 }
 
-async function getBaseAndHeadShas(
-  owner: string,
-  repo: string,
-  pull_number: number
-): Promise<{ baseSha: string; headSha: string }> {
-  const prResponse = await octokit.pulls.get({
-    owner,
-    repo,
-    pull_number,
-  });
-  return {
-    baseSha: prResponse.data.base.sha,
-    headSha: prResponse.data.head.sha,
-  };
-}
-
 function createPrompt(file: File, chunk: Chunk, prDetails: PRDetails): string {
   return `Your task is to review pull requests. Instructions:
-- Provide the response in following JSON format:  [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]
+- Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise return an empty array.
+- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
 - Write the comment in GitHub Markdown format.
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
@@ -132,7 +115,7 @@ async function getAIResponse(prompt: string): Promise<Array<{
   reviewComment: string;
 }> | null> {
   const queryConfig = {
-    model: "gpt-4",
+    model: OPENAI_API_MODEL,
     temperature: 0.2,
     max_tokens: 700,
     top_p: 1,
@@ -141,8 +124,12 @@ async function getAIResponse(prompt: string): Promise<Array<{
   };
 
   try {
-    const response = await openai.createChatCompletion({
+    const response = await openai.chat.completions.create({
       ...queryConfig,
+      // return JSON if the model supports it:
+      ...(OPENAI_API_MODEL === "gpt-4-1106-preview"
+        ? { response_format: { type: "json_object" } }
+        : {}),
       messages: [
         {
           role: "system",
@@ -151,8 +138,8 @@ async function getAIResponse(prompt: string): Promise<Array<{
       ],
     });
 
-    const res = response.data.choices[0].message?.content?.trim() || "[]";
-    return JSON.parse(res);
+    const res = response.choices[0].message?.content?.trim() || "{}";
+    return JSON.parse(res).reviews;
   } catch (error) {
     console.error("Error:", error);
     return null;
@@ -212,17 +199,16 @@ async function main() {
     const newHeadSha = eventData.after;
 
     const response = await octokit.repos.compareCommits({
+      headers: {
+        accept: "application/vnd.github.v3.diff",
+      },
       owner: prDetails.owner,
       repo: prDetails.repo,
       base: newBaseSha,
       head: newHeadSha,
     });
 
-    diff = response.data.diff_url
-      ? await octokit
-          .request({ url: response.data.diff_url })
-          .then((res) => res.data)
-      : null;
+    diff = String(response.data);
   } else {
     console.log("Unsupported event:", process.env.GITHUB_EVENT_NAME);
     return;
